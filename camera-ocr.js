@@ -17,11 +17,15 @@
 
   var TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 
+  // Model huấn luyện "best" chính xác hơn bản mặc định của Tesseract.js, nhất là dấu tiếng Việt.
+  var BEST_LANG_PATH = { vie: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/vie/4.0.0_best_int' };
+
   var DEFAULTS = {
     lang: 'vie',            // 'vie', 'eng', 'vie+eng' ...
     psm: 7,                 // 7 = một dòng; 6 = một khối nhiều dòng
     multiline: false,       // true: giữ nhiều dòng (nối bằng khoảng trắng), tự đặt psm = 6
-    minConfidence: 65,      // 0-100, độ tin cậy tối thiểu để tự động nhận
+    minConfidence: 60,      // 0-100, độ tin cậy tối thiểu để tự động nhận
+    binarize: true,         // lọc nền thành đen/trắng theo từng vùng (chống bóng, ánh sáng không đều)
     stableReads: 2,         // số lần quét liên tiếp cho kết quả giống nhau mới tự điền
     intervalMs: 350,        // nghỉ giữa các lần quét
     charWhitelist: '',      // ví dụ '0123456789' để chỉ nhận số
@@ -30,7 +34,8 @@
     buttonText: 'Quét',
     buttonClass: '',        // thêm class cho nút để khớp giao diện trang
     tesseractSrc: TESSERACT_SRC,
-    langPath: '',           // thư mục chứa *.traineddata nếu muốn tự host (ví dụ '/tessdata')
+    langPath: '',           // thư mục chứa *.traineddata nếu muốn tự host; để trống = dùng model tốt nhất có sẵn
+    debug: false,           // true: lưu khung đã xử lý vào window.__cameraOcrFrame để kiểm tra
     onResult: null          // function (text, input) gọi sau khi điền
   };
 
@@ -67,7 +72,8 @@
     workerKey = key;
     worker = loadTesseract(opts.tesseractSrc).then(function (T) {
       var cfg = { logger: function (m) { if (onProgress) onProgress(m); } };
-      if (opts.langPath) cfg.langPath = opts.langPath;
+      var lp = opts.langPath || BEST_LANG_PATH[opts.lang];
+      if (lp) cfg.langPath = lp;
       return T.createWorker(opts.lang, 1, cfg);
     }).then(function (w) {
       var params = {
@@ -106,26 +112,61 @@
     return 1 - prev[b.length] / Math.max(a.length, b.length);
   }
 
-  // Tăng tương phản + chuyển xám để Tesseract đọc dấu tiếng Việt tốt hơn.
-  function preprocess(canvas) {
-    var ctx = canvas.getContext('2d');
-    var img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    var d = img.data, n = d.length / 4, hist = new Array(256), i;
+  // Chuyển xám, kéo giãn tương phản, rồi (tuỳ chọn) lọc nền bằng ngưỡng thích ứng theo vùng.
+  // Trả về độ nét (phương sai Laplace) để bỏ qua khung hình bị mờ.
+  function preprocess(canvas, binarize) {
+    var ctx = canvas.getContext('2d', { willReadFrequently: true });
+    var w = canvas.width, h = canvas.height;
+    var img = ctx.getImageData(0, 0, w, h);
+    var d = img.data, n = w * h, gray = new Uint8ClampedArray(n), hist = new Array(256), i, x, y;
     for (i = 0; i < 256; i++) hist[i] = 0;
-    for (i = 0; i < d.length; i += 4) {
-      var g = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000 | 0;
-      d[i] = g; hist[g]++;
+    for (i = 0; i < n; i++) {
+      var g = (d[i * 4] * 299 + d[i * 4 + 1] * 587 + d[i * 4 + 2] * 114) / 1000 | 0;
+      gray[i] = g; hist[g]++;
     }
     var lo = 0, hi = 255, acc = 0;
     for (i = 0; i < 256; i++) { acc += hist[i]; if (acc >= n * 0.02) { lo = i; break; } }
     acc = 0;
     for (i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= n * 0.02) { hi = i; break; } }
     var range = Math.max(hi - lo, 1);
-    for (i = 0; i < d.length; i += 4) {
-      var v = Math.max(0, Math.min(255, (d[i] - lo) * 255 / range));
-      d[i] = d[i + 1] = d[i + 2] = v;
+    for (i = 0; i < n; i++) gray[i] = (gray[i] - lo) * 255 / range;
+
+    var sum = 0, sum2 = 0, cnt = 0;
+    for (y = 1; y < h - 1; y += 2) {
+      for (x = 1; x < w - 1; x += 2) {
+        i = y * w + x;
+        var lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w];
+        sum += lap; sum2 += lap * lap; cnt++;
+      }
     }
+    var sharp = cnt ? sum2 / cnt - Math.pow(sum / cnt, 2) : 0;
+
+    var out = gray;
+    if (binarize) {
+      // Ảnh tích phân → trung bình cục bộ (Bradley); chữ tối hơn nền cục bộ ~12% là chữ.
+      var integ = new Float64Array((w + 1) * (h + 1));
+      for (y = 1; y <= h; y++) {
+        var row = 0;
+        for (x = 1; x <= w; x++) {
+          row += gray[(y - 1) * w + x - 1];
+          integ[y * (w + 1) + x] = integ[(y - 1) * (w + 1) + x] + row;
+        }
+      }
+      var r = Math.max(8, Math.round(h / 2)), bin = new Uint8ClampedArray(n);
+      for (y = 0; y < h; y++) {
+        var y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+        for (x = 0; x < w; x++) {
+          var x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+          var area = (x1 - x0) * (y1 - y0);
+          var s = integ[y1 * (w + 1) + x1] - integ[y0 * (w + 1) + x1] - integ[y1 * (w + 1) + x0] + integ[y0 * (w + 1) + x0];
+          bin[y * w + x] = gray[y * w + x] * area < s * 0.88 ? 0 : 255;
+        }
+      }
+      out = bin;
+    }
+    for (i = 0; i < n; i++) { var v = out[i]; d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; d[i * 4 + 3] = 255; }
     ctx.putImageData(img, 0, 0);
+    return sharp;
   }
 
   var CSS = [
@@ -136,9 +177,9 @@
     '.top b{font-size:16px}',
     '.stage{position:relative;flex:1;overflow:hidden;background:#111}',
     'video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}',
-    '.box{position:absolute;left:50%;top:42%;width:88%;max-width:720px;height:96px;transform:translate(-50%,-50%);border:3px solid #22c55e;border-radius:10px;box-shadow:0 0 0 100vmax rgba(0,0,0,.55);pointer-events:none;transition:border-color .2s}',
+    '.box{position:absolute;left:50%;top:42%;width:88%;max-width:720px;height:80px;transform:translate(-50%,-50%);border:3px solid #22c55e;border-radius:10px;box-shadow:0 0 0 100vmax rgba(0,0,0,.55);pointer-events:none;transition:border-color .2s}',
     '.box.busy{border-color:#facc15}',
-    '.hint{position:absolute;left:0;right:0;top:calc(42% - 96px);text-align:center;font-size:13px;text-shadow:0 1px 3px #000;padding:0 12px}',
+    '.hint{position:absolute;left:0;right:0;top:calc(42% - 88px);text-align:center;font-size:13px;text-shadow:0 1px 3px #000;padding:0 12px}',
     '.bottom{padding:12px 14px calc(12px + env(safe-area-inset-bottom));background:rgba(0,0,0,.75);display:flex;flex-direction:column;gap:10px}',
     '.result{min-height:42px;padding:8px 10px;border-radius:8px;background:#1f2937;font-size:17px;word-break:break-word}',
     '.result small{display:block;color:#9ca3af;font-size:12px}',
@@ -179,7 +220,7 @@
       var stream = null, closed = false, facing = 'environment', timer = null;
       var current = '', last = '', stable = 0;
       var work = document.createElement('canvas');
-      var workCtx = null;
+      var workCtx = null, lastSharp = 0, bestSharp = 0;
 
       function setState(msg, isErr) {
         stateEl.textContent = msg;
@@ -241,15 +282,23 @@
         var scale = Math.max(sr.width / vw, sr.height / vh);
         var offX = (vw * scale - sr.width) / 2, offY = (vh * scale - sr.height) / 2;
         var sx = Math.max(0, (br.left - sr.left + offX) / scale);
-        var sy = Math.max(0, (br.top - sr.top + offY) / scale);
+        // Nới thêm ~14% chiều cao khung ở trên/dưới để dấu (ễ, ặ, ...) lệch ra mép khung không bị cắt.
+        var ext = br.height * 0.14;
+        var sy = Math.max(0, (br.top - ext - sr.top + offY) / scale);
         var sw = Math.min(vw - sx, br.width / scale);
-        var sh = Math.min(vh - sy, br.height / scale);
+        var sh = Math.min(vh - sy, (br.height + ext * 2) / scale);
         if (sw < 8 || sh < 8) return null;
         var up = Math.min(3, Math.max(1, 1200 / sw));   // phóng to vùng nhỏ cho dấu rõ hơn
-        work.width = Math.round(sw * up);
-        work.height = Math.round(sh * up);
-        (workCtx = workCtx || work.getContext('2d', { willReadFrequently: true })).drawImage(video, sx, sy, sw, sh, 0, 0, work.width, work.height);
-        preprocess(work);
+        var pad = 12;                                    // viền trắng quanh chữ giúp Tesseract đọc ổn định
+        work.width = Math.round(sw * up) + pad * 2;
+        work.height = Math.round(sh * up) + pad * 2;
+        workCtx = workCtx || work.getContext('2d', { willReadFrequently: true });
+        workCtx.fillStyle = '#fff';
+        workCtx.fillRect(0, 0, work.width, work.height);
+        workCtx.imageSmoothingQuality = 'high';
+        workCtx.drawImage(video, sx, sy, sw, sh, pad, pad, work.width - pad * 2, work.height - pad * 2);
+        lastSharp = preprocess(work, opts.binarize);
+        if (opts.debug) global.__cameraOcrFrame = work;
         return work;
       }
 
@@ -257,12 +306,21 @@
         if (closed) return;
         var frame = video.readyState >= 2 ? cropFrame() : null;
         if (!frame) { timer = setTimeout(function () { loop(w); }, 200); return; }
+        bestSharp = Math.max(bestSharp * 0.97, lastSharp);
+        if (lastSharp < bestSharp * 0.5) {   // khung đang mờ (rung tay, chưa lấy nét): bỏ qua
+          setState('Giữ máy chắc tay, chờ lấy nét…');
+          timer = setTimeout(function () { loop(w); }, 120);
+          return;
+        }
+        setState('Đang quét…');
         box.classList.add('busy');
         w.recognize(frame).then(function (res) {
           if (closed) return;
           box.classList.remove('busy');
           var text = normalize(res.data.text, opts);
           var conf = res.data.confidence || 0;
+          var ws = (res.data.words || []).filter(function (x) { return x.text && x.text.trim(); });
+          if (ws.length) conf = ws.reduce(function (a, x) { return a + x.confidence; }, 0) / ws.length;
           if (text.length >= 2) {
             current = text;
             useBtn.disabled = false;
@@ -341,6 +399,8 @@
     if (d.minConfidence) o.minConfidence = +d.minConfidence;
     if (d.buttonText) o.buttonText = d.buttonText;
     if (d.langPath) o.langPath = d.langPath;
+    if (d.debug != null) o.debug = d.debug !== 'false';
+    if (d.binarize != null) o.binarize = d.binarize !== 'false';
     return o;
   }
 
