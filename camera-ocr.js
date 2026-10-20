@@ -15,7 +15,7 @@
 (function (global) {
   'use strict';
 
-  var VERSION = '2.1';
+  var VERSION = '2.2';
   var TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 
   // Model huấn luyện "best" chính xác hơn bản mặc định của Tesseract.js, nhất là dấu tiếng Việt.
@@ -160,14 +160,39 @@
           var x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
           var area = (x1 - x0) * (y1 - y0);
           var s = integ[y1 * (w + 1) + x1] - integ[y0 * (w + 1) + x1] - integ[y1 * (w + 1) + x0] + integ[y0 * (w + 1) + x0];
-          bin[y * w + x] = gray[y * w + x] * area < s * 0.88 ? 0 : 255;
+          var mean = s / area, gv = gray[y * w + x];
+          bin[y * w + x] = (gv < mean * 0.88 && mean - gv > 22) ? 0 : 255;   // phải tối hơn nền đủ rõ, tránh nhiễu vùng tối
         }
       }
       out = bin;
     }
     for (i = 0; i < n; i++) { var v = out[i]; d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; d[i * 4 + 3] = 255; }
     ctx.putImageData(img, 0, 0);
-    return sharp;
+    return { sharp: sharp, pix: out };
+  }
+
+  // Tìm các dải dòng chữ theo số điểm đen từng hàng, trả về [y0, y1] của dòng gần tâm nhất.
+  function centerLine(pix, w, h) {
+    var cnt = new Array(h), y, x, thr = Math.max(3, w * 0.008);
+    for (y = 0; y < h; y++) {
+      var c = 0, o = y * w;
+      for (x = 0; x < w; x++) if (pix[o + x] < 128) c++;
+      cnt[y] = c;
+    }
+    var gap = Math.max(3, Math.round(h * 0.05)), bands = [], start = -1, last = -1;
+    for (y = 0; y < h; y++) {
+      if (cnt[y] >= thr) { if (start < 0) start = y; last = y; }
+      else if (start >= 0 && y - last > gap) { bands.push([start, last]); start = -1; }
+    }
+    if (start >= 0) bands.push([start, last]);
+    bands = bands.filter(function (b) { return b[1] - b[0] >= Math.max(6, h * 0.08); });
+    if (!bands.length) return null;
+    var mid = h / 2, best = null, bd = 1e9;
+    bands.forEach(function (b) {
+      var d = Math.abs((b[0] + b[1]) / 2 - mid);
+      if (d < bd) { bd = d; best = b; }
+    });
+    return best;
   }
 
   var CSS = [
@@ -221,7 +246,7 @@
 
       var stream = null, closed = false, facing = 'environment', timer = null;
       var current = '', last = '', stable = 0;
-      var work = document.createElement('canvas');
+      var work = document.createElement('canvas'), lineCanvas = document.createElement('canvas');
       var workCtx = null, lastSharp = 0, bestSharp = 0;
 
       function setState(msg, isErr) {
@@ -299,11 +324,29 @@
         workCtx.fillRect(0, 0, work.width, work.height);
         workCtx.imageSmoothingQuality = 'high';
         workCtx.drawImage(video, sx, sy, sw, sh, pad, pad, work.width - pad * 2, work.height - pad * 2);
-        lastSharp = preprocess(work, opts.binarize);
-        pvCanvas.width = work.width; pvCanvas.height = work.height;
-        pvCanvas.getContext('2d').drawImage(work, 0, 0);
-        if (opts.debug) global.__cameraOcrFrame = work;
-        return work;
+        var pp = preprocess(work, opts.binarize);
+        lastSharp = pp.sharp;
+        var out = work;
+        if (opts.psm === 7 && opts.binarize) {            // chế độ một dòng: chỉ đọc dòng nằm giữa khung
+          var band = centerLine(pp.pix, work.width, work.height);
+          if (band) {
+            var bh = band[1] - band[0] + 1, m = Math.round(bh * 0.3) + 6;
+            var y0 = Math.max(0, band[0] - m), y1 = Math.min(work.height, band[1] + m + 1);
+            var k = Math.min(3, Math.max(0.5, 64 / bh));   // đưa chiều cao chữ về cỡ Tesseract đọc tốt nhất
+            lineCanvas.width = Math.round(work.width * k);
+            lineCanvas.height = Math.round((y1 - y0) * k);
+            var lc = lineCanvas.getContext('2d');
+            lc.fillStyle = '#fff'; lc.fillRect(0, 0, lineCanvas.width, lineCanvas.height);
+            lc.imageSmoothingQuality = 'high';
+            lc.drawImage(work, 0, y0, work.width, y1 - y0, 0, 0, lineCanvas.width, lineCanvas.height);
+            out = lineCanvas;
+          }
+        }
+        pvCanvas.width = out.width; pvCanvas.height = out.height;
+        pvCanvas.getContext('2d').drawImage(out, 0, 0);
+        if (opts.debug) global.__cameraOcrFrame = out;
+        return out;
+
       }
 
       function loop(w) {
