@@ -15,6 +15,7 @@
 (function (global) {
   'use strict';
 
+  var VERSION = '2.1';
   var TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 
   // Model huấn luyện "best" chính xác hơn bản mặc định của Tesseract.js, nhất là dấu tiếng Việt.
@@ -179,6 +180,7 @@
     'video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}',
     '.box{position:absolute;left:50%;top:42%;width:88%;max-width:720px;height:80px;transform:translate(-50%,-50%);border:3px solid #22c55e;border-radius:10px;box-shadow:0 0 0 100vmax rgba(0,0,0,.55);pointer-events:none;transition:border-color .2s}',
     '.box.busy{border-color:#facc15}',
+    '.pv{position:absolute;left:8px;right:8px;bottom:8px;width:calc(100% - 16px);max-height:70px;object-fit:contain;background:#fff;border-radius:6px;opacity:.9}',
     '.hint{position:absolute;left:0;right:0;top:calc(42% - 88px);text-align:center;font-size:13px;text-shadow:0 1px 3px #000;padding:0 12px}',
     '.bottom{padding:12px 14px calc(12px + env(safe-area-inset-bottom));background:rgba(0,0,0,.75);display:flex;flex-direction:column;gap:10px}',
     '.result{min-height:42px;padding:8px 10px;border-radius:8px;background:#1f2937;font-size:17px;word-break:break-word}',
@@ -204,9 +206,9 @@
       root.innerHTML =
         '<style>' + CSS + '</style>' +
         '<div class="wrap" role="dialog" aria-modal="true" aria-label="Quét chữ bằng camera">' +
-        '<div class="top"><b>Quét chữ</b><span class="state">Đang mở camera…</span></div>' +
+        '<div class="top"><b>Quét chữ <small style="font-weight:400;opacity:.6">v' + VERSION + '</small></b><span class="state">Đang mở camera…</span></div>' +
         '<div class="stage"><video playsinline muted autoplay></video>' +
-        '<div class="hint">Đưa dòng chữ vào trong khung xanh</div><div class="box"></div></div>' +
+        '<div class="hint">Đưa dòng chữ vào trong khung xanh</div><div class="box"></div><canvas class="pv"></canvas></div>' +
         '<div class="bottom"><div class="result"><small>Kết quả</small><span class="text">—</span></div>' +
         '<div class="row"><button class="torch" hidden>Đèn</button><button class="flip">Đổi camera</button>' +
         '<button class="cancel">Đóng</button><button class="primary use" disabled>Dùng kết quả</button></div></div></div>';
@@ -214,7 +216,7 @@
 
       var $ = function (s) { return root.querySelector(s); };
       var video = $('video'), stage = $('.stage'), box = $('.box'),
-          stateEl = $('.state'), textEl = $('.text'), useBtn = $('.use'),
+          stateEl = $('.state'), pvCanvas = $('.pv'), textEl = $('.text'), useBtn = $('.use'),
           torchBtn = $('.torch'), flipBtn = $('.flip');
 
       var stream = null, closed = false, facing = 'environment', timer = null;
@@ -298,6 +300,8 @@
         workCtx.imageSmoothingQuality = 'high';
         workCtx.drawImage(video, sx, sy, sw, sh, pad, pad, work.width - pad * 2, work.height - pad * 2);
         lastSharp = preprocess(work, opts.binarize);
+        pvCanvas.width = work.width; pvCanvas.height = work.height;
+        pvCanvas.getContext('2d').drawImage(work, 0, 0);
         if (opts.debug) global.__cameraOcrFrame = work;
         return work;
       }
